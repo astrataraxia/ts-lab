@@ -16,10 +16,13 @@ export function mountHomePage(root: HTMLDivElement) {
       <section class="home-hero">
         <div class="hero-copy">
           <p class="home-eyebrow">DIGITAL PLAYGROUND · 2026</p>
-          <h1>작은 실험들이<br /><em>새로운 장면</em>이 됩니다.</h1>
+          <h1>
+            <span>작은 실험들이</span>
+            <span><em>새로운 장면이</em></span>
+            <span>됩니다.</span>
+          </h1>
           <p class="hero-description">
             소리, 움직임, 놀이를 모아두는 개인 실험 공간입니다.<br />
-            지금은 두 개의 작은 프로젝트를 준비하고 있습니다.
           </p>
           <a class="hero-link" href="#/visualizer">Explore the studio <span>↗</span></a>
         </div>
