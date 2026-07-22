@@ -1,7 +1,8 @@
 import { mountHomePage } from "./pages/home/page";
+import { mountOrdHelper } from "./pages/ord-helper/controller";
 import { mountVisualizer } from "./pages/sound-canvas/controller";
 
-type Route = "home" | "visualizer";
+type Route = "home" | "visualizer" | "ord-helper";
 
 export function startRouter(root: HTMLDivElement) {
   let cleanup: (() => void) | undefined;
@@ -12,6 +13,11 @@ export function startRouter(root: HTMLDivElement) {
 
     if (getCurrentRoute() === "visualizer") {
       cleanup = mountVisualizer(root);
+      return;
+    }
+
+    if (getCurrentRoute() === "ord-helper") {
+      cleanup = mountOrdHelper(root);
       return;
     }
 
@@ -32,5 +38,13 @@ export function startRouter(root: HTMLDivElement) {
 }
 
 function getCurrentRoute(): Route {
-  return window.location.hash === "#/visualizer" ? "visualizer" : "home";
+  if (window.location.hash === "#/visualizer") {
+    return "visualizer";
+  }
+
+  if (window.location.hash === "#/ord-helper") {
+    return "ord-helper";
+  }
+
+  return "home";
 }

@@ -7,7 +7,7 @@ export function mountHomePage(root: HTMLDivElement) {
         <nav class="site-nav" aria-label="주요 메뉴">
           <a class="is-current" href="#/home">Home</a>
           <a href="#/visualizer">Explore</a>
-          <button type="button" disabled>Game Lab</button>
+          <a href="#/ord-helper">ORD Helper</a>
         </nav>
 
         <button class="menu-button" type="button" aria-label="메뉴">☰</button>
@@ -64,9 +64,9 @@ export function mountHomePage(root: HTMLDivElement) {
               <span class="module-status">COMING SOON</span>
             </div>
             <div>
-              <p class="module-label">INTERACTIVE PLAY</p>
-              <h3>Game Lab</h3>
-              <p>작은 규칙과 움직임으로 만드는 인터랙티브 게임</p>
+            <p class="module-label">ORD ADVISOR</p>
+              <h3>ORD Helper</h3>
+              <p>TMO.GG와 연동해 원랜디 조합을 추천하는 보조 도구</p>
             </div>
             <div class="card-grid" aria-hidden="true"></div>
           </button>
