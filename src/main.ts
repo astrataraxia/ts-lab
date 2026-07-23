@@ -1,5 +1,5 @@
 import "./styles/global.css";
-import { startRouter } from "./app/router";
+import { mountHomePage } from "./app/pages/home/page";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 
@@ -7,4 +7,4 @@ if (!app) {
   throw new Error("App root element was not found.");
 }
 
-startRouter(app);
+mountHomePage(app);
