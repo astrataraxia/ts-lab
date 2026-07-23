@@ -11,14 +11,21 @@ import {
 } from "./logic/recommendations";
 import { mountOrdHelperPage } from "./page";
 import { createTmoDataSource } from "./services/tmo-data-source";
-import type { Recommendation, TmoSnapshot } from "./types";
+import type {
+  Recommendation,
+  RecommendationPathNode,
+  TmoSnapshot,
+  UnitDefinition,
+} from "./types";
 
 export function mountOrdHelper(root: HTMLDivElement) {
   const elements = mountOrdHelperPage(root);
   const dataSource = createTmoDataSource();
 
   let snapshot: TmoSnapshot = { units: {}, banned: [], receivedAt: 0 };
-  let catalog: readonly import("./types").UnitDefinition[] = [];
+  let catalog: readonly UnitDefinition[] = [];
+  let catalogLookup = new Map<string, UnitDefinition>();
+  const demoLookup = createCatalogLookup(DEMO_CATALOG);
   let catalogModel: RecommendationModel | null = null;
   let demoModel: RecommendationModel | null = null;
   let aliases: Record<string, string> = {};
@@ -26,12 +33,9 @@ export function mountOrdHelper(root: HTMLDivElement) {
 
   const render = () => {
     const activeModel = isDemo ? demoModel : catalogModel;
-    const activeCatalog =
-      activeModel?.catalog ?? (isDemo ? DEMO_CATALOG : catalog);
-    const hasKnownCatalogData = Object.keys(snapshot.units).some((id) =>
-      activeCatalog.some(
-        (unit) => unit.id === id || Object.hasOwn(unit.recipe, id),
-      ),
+    const activeLookup = isDemo ? demoLookup : catalogLookup;
+    const hasKnownCatalogData = Object.keys(snapshot.units).some(
+      (id) => activeLookup.has(id.toLowerCase()) || isDemo,
     );
     const recommendations =
       activeModel && (isDemo || hasKnownCatalogData)
@@ -39,38 +43,44 @@ export function mountOrdHelper(root: HTMLDivElement) {
         : [];
     const observedUnitIds = Object.keys(snapshot.units).sort();
 
-    elements.sourceLabel.textContent = isDemo ? "DEMO" : "LIVE";
-    elements.observedUnitCount.textContent = String(observedUnitIds.length);
-    elements.bannedUnitCount.textContent = String(snapshot.banned.length);
-    elements.receivedAt.textContent = snapshot.receivedAt
-      ? formatTime(snapshot.receivedAt)
-      : "—";
+    updateSnapshotMeta(elements, snapshot, isDemo, observedUnitIds.length);
     elements.observedUnits.innerHTML = renderObservedUnits(
       observedUnitIds,
       snapshot,
-      activeCatalog,
+      activeLookup,
     );
     elements.recommendations.innerHTML = renderRecommendations(
       recommendations,
-      snapshot,
       snapshot.receivedAt > 0,
-      activeCatalog,
     );
   };
 
   const stopPolling = dataSource.start({
     onSnapshot: (nextSnapshot) => {
-      snapshot = normalizeSnapshot(nextSnapshot, aliases, catalog);
+      const normalizedSnapshot = normalizeSnapshot(
+        nextSnapshot,
+        aliases,
+        catalogLookup,
+      );
+      const shouldRender =
+        snapshot.receivedAt === 0 ||
+        !sameSnapshotData(snapshot, normalizedSnapshot) ||
+        !catalogModel;
+      snapshot = normalizedSnapshot;
       isDemo = false;
       setConnectionState(elements, true, "TMO.GG 데스크톱 연결됨");
       elements.connectionDetail.textContent =
-        "게임 상태를 2초 간격으로 받고 있습니다.";
-      render();
+        "게임 상태를 1초 간격으로 받고 있습니다.";
+      if (shouldRender) {
+        render();
+      } else {
+        updateSnapshotMeta(elements, snapshot, false, undefined);
+      }
     },
     onError: (message) => {
       if (!isDemo) {
         setConnectionState(elements, false, "TMO.GG 데스크톱 미연동");
-        elements.connectionDetail.textContent = `${message} 데스크톱을 실행한 뒤 다시 확인합니다.`;
+        elements.connectionDetail.textContent = `${message} 잠시 후 다시 확인합니다.`;
       }
     },
   });
@@ -78,12 +88,13 @@ export function mountOrdHelper(root: HTMLDivElement) {
   void Promise.all([loadOrdCatalog(), loadOrdAliases()])
     .then(([nextCatalog, nextAliases]) => {
       catalog = nextCatalog;
+      catalogLookup = createCatalogLookup(nextCatalog);
       catalogModel = createRecommendationModel(nextCatalog);
       aliases = nextAliases;
-      snapshot = normalizeSnapshot(snapshot, aliases, catalog);
+      snapshot = normalizeSnapshot(snapshot, aliases, catalogLookup);
       elements.connectionDetail.textContent = isDemo
         ? "실제 연결 전에도 추천 화면과 데이터 흐름을 확인할 수 있습니다."
-        : `원랜디 조합 데이터 ${catalog.length}개를 준비했습니다.`;
+        : `원랜디 조합 데이터 ${catalog.length}개 · /datas 1초 간격`;
       render();
     })
     .catch((error: unknown) => {
@@ -95,10 +106,6 @@ export function mountOrdHelper(root: HTMLDivElement) {
       }
     });
 
-  const onLaunchClick = () => {
-    window.location.href = "tmogg://run";
-  };
-
   const onDemoClick = () => {
     demoModel ??= createRecommendationModel(DEMO_CATALOG);
     snapshot = { ...DEMO_SNAPSHOT, receivedAt: Date.now() };
@@ -109,13 +116,11 @@ export function mountOrdHelper(root: HTMLDivElement) {
     render();
   };
 
-  elements.launchButton.addEventListener("click", onLaunchClick);
   elements.demoButton.addEventListener("click", onDemoClick);
   render();
 
   return () => {
     stopPolling();
-    elements.launchButton.removeEventListener("click", onLaunchClick);
     elements.demoButton.removeEventListener("click", onDemoClick);
   };
 }
@@ -129,30 +134,54 @@ function setConnectionState(
   elements.connectionDot.classList.toggle("is-connected", connected);
 }
 
+function updateSnapshotMeta(
+  elements: ReturnType<typeof mountOrdHelperPage>,
+  snapshot: TmoSnapshot,
+  isDemo: boolean,
+  observedUnitCount = Object.keys(snapshot.units).length,
+) {
+  elements.sourceLabel.textContent = isDemo ? "DEMO" : "LIVE";
+  elements.observedUnitCount.textContent = String(observedUnitCount);
+  elements.bannedUnitCount.textContent = String(snapshot.banned.length);
+  elements.receivedAt.textContent = snapshot.receivedAt
+    ? formatTime(snapshot.receivedAt)
+    : "—";
+}
+
+function sameSnapshotData(left: TmoSnapshot, right: TmoSnapshot): boolean {
+  const leftUnitIds = Object.keys(left.units);
+  const rightUnitIds = Object.keys(right.units);
+
+  return (
+    leftUnitIds.length === rightUnitIds.length &&
+    leftUnitIds.every((id) => right.units[id] === left.units[id]) &&
+    left.banned.length === right.banned.length &&
+    left.banned.every((id, index) => right.banned[index] === id)
+  );
+}
+
 function renderObservedUnits(
   ids: string[],
   snapshot: TmoSnapshot,
-  catalog: readonly import("./types").UnitDefinition[],
+  catalogLookup: ReadonlyMap<string, UnitDefinition>,
 ): string {
   if (ids.length === 0) {
-    return '<p class="empty-state">TMO.GG 연결 후 유닛 이름과 보유 수량이 표시됩니다.</p>';
+    return '<p class="empty-state">/datas 연결 후 보유 유닛이 작게 표시됩니다.</p>';
   }
 
   return ids
     .slice(0, 24)
     .map((id) => {
       const banned = snapshot.banned.includes(id);
-      const name = getUnitName(id, catalog);
-      return `<span class="observed-unit${banned ? " is-banned" : ""}"><strong>${escapeHtml(name)}</strong><code>${escapeHtml(id)}</code><span>×${snapshot.units[id]}</span></span>`;
+      const name = getUnitName(id, catalogLookup);
+      return `<span class="observed-unit${banned ? " is-banned" : ""}" title="${escapeHtml(id)}"><strong>${escapeHtml(name)}</strong><span>×${snapshot.units[id]}</span></span>`;
     })
     .join("");
 }
 
 function renderRecommendations(
   recommendations: Recommendation[],
-  snapshot: TmoSnapshot,
   hasSnapshot: boolean,
-  catalog: readonly import("./types").UnitDefinition[],
 ): string {
   if (recommendations.length === 0) {
     return hasSnapshot
@@ -160,118 +189,30 @@ function renderRecommendations(
       : '<p class="empty-state">현재 상태를 기다리는 중입니다.</p>';
   }
 
-  return recommendations
-    .map((recommendation, index) => {
-      const statusLabel =
-        recommendation.status === "ready"
-          ? "지금 가능"
-          : recommendation.status === "near"
-            ? "거의 준비"
-            : "계획 후보";
-      const progress = Math.round(recommendation.progress * 100);
-      const ingredients = recommendation.ingredients
-        .map((item) => {
-          const replacement =
-            item.coveredByWisp > 0 ? `, 위습 ${item.coveredByWisp}개 대체` : "";
-          const shortage =
-            item.remaining > 0 ? `, ${item.remaining}개 부족` : "";
-          return `${item.name} ${item.owned}/${item.required}${replacement}${shortage}`;
-        })
-        .join(" · ");
-      const wisp =
-        recommendation.wispUsed > 0
-          ? `위습 ${recommendation.wispUsed}/${recommendation.wispOwned}개 사용`
-          : "위습 사용 없음";
-      const pathMissing = recommendation.missingPath
-        .map((item) => `${item.name} ${item.count}개`)
-        .join(" · ");
-      const target = `목표 ${recommendation.target.name} ${Math.round(recommendation.target.progress * 100)}%`;
-      const targetRoles = recommendation.target.roles.length
-        ? `목표 역할: ${recommendation.target.roles.join(" · ")}`
-        : "";
-      const targetResource =
-        recommendation.target.skillResource !== "없음"
-          ? `스킬 자원: ${recommendation.target.skillResource}`
-          : "";
-      const enhancements = recommendation.target.enhancements
-        .map((item) => {
-          const owned = snapshot.units[item.id] ?? 0;
-          const state =
-            owned >= item.count
-              ? "보유"
-              : item.required
-                ? "필수 미보유"
-                : "강화 미보유";
-          return `${item.name} ${owned}/${item.count} (${state})`;
-        })
-        .join(" · ");
-      const resources = Object.entries(recommendation.resourceRequirements)
-        .map(([id, required]) => {
-          const owned = recommendation.unknownResources.includes(id)
-            ? "?"
-            : String(
-                recommendation.missingResources.find((item) => item.id === id)
-                  ?.owned ?? required,
-              );
-          return `${getUnitName(id, catalog)} ${owned}/${required}`;
-        })
-        .join(" · ");
-      const detail =
-        [
-          target,
-          targetRoles,
-          targetResource,
-          enhancements ? `강화 아이템: ${enhancements}` : "",
-          pathMissing ? `경로 부족: ${pathMissing}` : "",
-          ingredients,
-          wisp,
-          resources,
-        ]
-          .filter(Boolean)
-          .join(" · ") ||
-        recommendation.unit.note ||
-        "추천 규칙에 의해 우선순위가 계산되었습니다.";
+  const trees = groupRecommendations(recommendations);
 
-      return `
-        <article class="recommendation-item">
-          <div class="recommendation-rank">0${index + 1}</div>
-          <div class="recommendation-body">
-            <div class="recommendation-title-row">
-              <h3>${escapeHtml(recommendation.unit.name)}</h3>
-              <span class="recommendation-status is-${recommendation.status}">${statusLabel}</span>
-            </div>
-            <p>${escapeHtml(recommendation.unit.role)} · ${escapeHtml(recommendation.reason)}</p>
-            <div class="recommendation-progress"><span style="width: ${progress}%"></span></div>
-            <small>${escapeHtml(detail)}</small>
-          </div>
-        </article>
-      `;
-    })
+  return trees
+    .map((tree, treeIndex) => renderRecommendationTree(tree, treeIndex))
     .join("");
 }
 
 function getUnitName(
   id: string,
-  catalog: readonly import("./types").UnitDefinition[],
+  catalogLookup: ReadonlyMap<string, UnitDefinition>,
 ): string {
-  return (
-    catalog.find((unit) => unit.id.toLowerCase() === id.toLowerCase())?.name ??
-    id
-  );
+  return catalogLookup.get(id.toLowerCase())?.name ?? id;
 }
 
 function normalizeSnapshot(
   snapshot: TmoSnapshot,
   aliases: Record<string, string>,
-  catalog: readonly import("./types").UnitDefinition[],
+  catalogLookup: ReadonlyMap<string, UnitDefinition>,
 ): TmoSnapshot {
   const units: Record<string, number> = {};
 
   for (const [id, count] of Object.entries(snapshot.units)) {
     const aliasedId = aliases[id] ?? aliases[id.toLowerCase()] ?? id;
-    const catalogUnit = catalog.find(
-      (unit) => unit.id.toLowerCase() === aliasedId.toLowerCase(),
-    );
+    const catalogUnit = catalogLookup.get(aliasedId.toLowerCase());
     const canonicalId = catalogUnit?.id ?? aliasedId;
     units[canonicalId] = (units[canonicalId] ?? 0) + count;
   }
@@ -281,13 +222,139 @@ function normalizeSnapshot(
     units,
     banned: snapshot.banned.map((id) => {
       const aliasedId = aliases[id] ?? aliases[id.toLowerCase()] ?? id;
-      return (
-        catalog.find(
-          (unit) => unit.id.toLowerCase() === aliasedId.toLowerCase(),
-        )?.id ?? aliasedId
-      );
+      return catalogLookup.get(aliasedId.toLowerCase())?.id ?? aliasedId;
     }),
   };
+}
+
+function createCatalogLookup(
+  catalog: readonly UnitDefinition[],
+): Map<string, UnitDefinition> {
+  return new Map(catalog.map((unit) => [unit.id.toLowerCase(), unit]));
+}
+
+type RecommendationTree = {
+  target: Recommendation["target"];
+  branches: RecommendationPathNode[][];
+};
+
+function groupRecommendations(
+  recommendations: Recommendation[],
+): RecommendationTree[] {
+  const trees = new Map<string, RecommendationTree>();
+
+  for (const recommendation of recommendations) {
+    const key = recommendation.target.id.toLowerCase();
+    const existing = trees.get(key);
+
+    if (existing) {
+      if (
+        !existing.branches.some((branch) =>
+          samePath(branch, recommendation.path),
+        )
+      ) {
+        existing.branches.push(recommendation.path);
+      }
+      continue;
+    }
+
+    trees.set(key, {
+      target: recommendation.target,
+      branches: [recommendation.path],
+    });
+  }
+
+  return Array.from(trees.values());
+}
+
+function samePath(
+  left: RecommendationPathNode[],
+  right: RecommendationPathNode[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (node, index) => node.id.toLowerCase() === right[index]?.id.toLowerCase(),
+    )
+  );
+}
+
+function renderRecommendationTree(
+  tree: RecommendationTree,
+  treeIndex: number,
+): string {
+  const targetProgress = Math.round(tree.target.progress * 100);
+  const statusLabel =
+    targetProgress === 100 && tree.target.missingResources.length === 0
+      ? "지금 가능"
+      : targetProgress >= 55
+        ? "거의 준비"
+        : "계획 후보";
+
+  return `
+    <article class="recommendation-tree">
+      <div class="recommendation-tree-heading">
+        <span class="recommendation-rank">0${treeIndex + 1}</span>
+        <div class="recommendation-tree-target">
+          <span class="recommendation-tree-label">최종 유닛</span>
+          <strong>${escapeHtml(tree.target.name)}</strong>
+          <span class="recommendation-tier is-target">${escapeHtml(tree.target.group)}</span>
+          <span class="recommendation-lane is-${tree.target.lane}">${escapeHtml(tree.target.lane)}</span>
+        </div>
+        <div class="recommendation-tree-readiness">
+          <span>${statusLabel}</span>
+          <strong>${targetProgress}%</strong>
+        </div>
+      </div>
+      ${renderResourceRequirements(tree.target)}
+      <div class="recommendation-tree-branches">
+        ${tree.branches.map((branch) => renderRecommendationBranch(branch)).join("")}
+      </div>
+      <div class="recommendation-progress is-target-progress"><span style="width: ${targetProgress}%"></span></div>
+    </article>
+  `;
+}
+
+function renderResourceRequirements(target: Recommendation["target"]): string {
+  const requirements = Object.entries(target.resourceRequirements);
+  if (requirements.length === 0) {
+    return "";
+  }
+
+  const missingById = new Map(
+    target.missingResources.map((resource) => [resource.id, resource]),
+  );
+  const resourceNames: Record<string, string> = {
+    GOLD: "금화",
+    LUMBER: "목재",
+    FOOD: "식량",
+    POINT: "특성포인트",
+  };
+  const items = requirements.map(([id, required]) => {
+    const missing = missingById.get(id);
+    const shortage = missing
+      ? ` · 부족 ${required - (missing.owned ?? 0)}`
+      : " · 확보";
+
+    return `<span class="${missing ? "is-missing" : ""}">${escapeHtml(resourceNames[id] ?? id)} ${required}${shortage}</span>`;
+  });
+
+  return `<div class="recommendation-tree-resources"><small>조합 자원</small>${items.join("")}</div>`;
+}
+
+function renderRecommendationBranch(path: RecommendationPathNode[]): string {
+  const nodes = path.map((node, index) => {
+    const isFinal = index === path.length - 1;
+    return `
+      <div class="recommendation-tree-node${isFinal ? " is-final" : ""}">
+        <strong>${escapeHtml(node.name)}</strong>
+        <span>${escapeHtml(node.group)}</span>
+        ${isFinal ? `<em>${escapeHtml(node.lane)}</em>` : ""}
+      </div>
+    `;
+  });
+
+  return `<div class="recommendation-tree-branch">${nodes.join('<span class="recommendation-tree-arrow" aria-hidden="true">›</span>')}</div>`;
 }
 
 function formatTime(timestamp: number): string {

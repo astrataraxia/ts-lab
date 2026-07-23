@@ -1,7 +1,7 @@
 import type { TmoSnapshot } from "../types";
 
 export const TMO_DATAS_ENDPOINT = "http://127.0.0.1:25625/datas";
-export const TMO_POLL_INTERVAL = 2_000;
+export const TMO_POLL_INTERVAL = 1_000;
 
 type TmoPayload = {
   units?: unknown;

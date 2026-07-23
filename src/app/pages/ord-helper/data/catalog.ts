@@ -19,6 +19,7 @@ type OrdAsset = {
 type OrdBuildHelperGroup = {
   name: string;
   units: OrdAsset[];
+  resourceCost?: Record<string, number>;
 };
 
 type OrdBuildHelperResponse = {
@@ -28,6 +29,13 @@ type OrdBuildHelperResponse = {
 type OrdCommonResponse = {
   ORD?: Record<string, string>;
 };
+
+type OrdSourceData = {
+  buildHelper: OrdBuildHelperResponse;
+  common: OrdCommonResponse;
+};
+
+let ordSourcePromise: Promise<OrdSourceData> | undefined;
 
 export const DEMO_CATALOG: readonly UnitDefinition[] = [
   {
@@ -73,32 +81,19 @@ export const DEMO_SNAPSHOT: TmoSnapshot = {
 };
 
 export async function loadOrdCatalog(): Promise<readonly UnitDefinition[]> {
-  const response = await fetch(ORD_ASSETS_URL);
+  const { buildHelper } = await loadOrdSourceData();
 
-  if (!response.ok) {
-    throw new Error("원랜디 조합 데이터를 불러오지 못했습니다.");
-  }
+  return (buildHelper.groups ?? []).flatMap((sourceGroup) => {
+    const group = normalizeGroupName(sourceGroup.name);
 
-  const payload = (await response.json()) as OrdBuildHelperResponse;
-
-  return (payload.groups ?? []).flatMap(({ name, units }) =>
-    units.map((unit) => toUnitDefinition(unit, normalizeGroupName(name))),
-  );
+    return sourceGroup.units.map((unit) =>
+      toUnitDefinition(unit, group, sourceGroup),
+    );
+  });
 }
 
 export async function loadOrdAliases(): Promise<Record<string, string>> {
-  const [buildHelperResponse, commonResponse] = await Promise.all([
-    fetch(ORD_ASSETS_URL),
-    fetch(ORD_COMMON_URL),
-  ]);
-
-  if (!buildHelperResponse.ok || !commonResponse.ok) {
-    throw new Error("원랜디 코드 호환 정보를 불러오지 못했습니다.");
-  }
-
-  const buildHelper =
-    (await buildHelperResponse.json()) as OrdBuildHelperResponse;
-  const common = (await commonResponse.json()) as OrdCommonResponse;
+  const { buildHelper, common } = await loadOrdSourceData();
   const units = (buildHelper.groups ?? []).flatMap((group) => group.units);
   const ids = new Set(units.map((unit) => unit.id));
   const codeOwners = new Map<string, string>();
@@ -133,7 +128,29 @@ export async function loadOrdAliases(): Promise<Record<string, string>> {
   );
 }
 
-function toUnitDefinition(unit: OrdAsset, group: string): UnitDefinition {
+function loadOrdSourceData(): Promise<OrdSourceData> {
+  ordSourcePromise ??= Promise.all([
+    fetch(ORD_ASSETS_URL),
+    fetch(ORD_COMMON_URL),
+  ]).then(async ([buildHelperResponse, commonResponse]) => {
+    if (!buildHelperResponse.ok || !commonResponse.ok) {
+      throw new Error("원랜디 코드 호환 정보를 불러오지 못했습니다.");
+    }
+
+    return {
+      buildHelper: (await buildHelperResponse.json()) as OrdBuildHelperResponse,
+      common: (await commonResponse.json()) as OrdCommonResponse,
+    };
+  });
+
+  return ordSourcePromise;
+}
+
+function toUnitDefinition(
+  unit: OrdAsset,
+  group: string,
+  sourceGroup: OrdBuildHelperGroup | undefined,
+): UnitDefinition {
   const recipe: Record<string, number> = {};
   const resources: Record<string, number> = {};
 
@@ -143,6 +160,12 @@ function toUnitDefinition(unit: OrdAsset, group: string): UnitDefinition {
     } else {
       recipe[stuff.id] = stuff.count;
     }
+  }
+
+  for (const [resourceId, resourceCount] of Object.entries(
+    sourceGroup?.resourceCost ?? {},
+  )) {
+    resources[resourceId] = (resources[resourceId] ?? 0) + resourceCount;
   }
 
   const abilityNames = Object.keys(unit.abilities ?? {});

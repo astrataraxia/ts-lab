@@ -5,6 +5,7 @@ import type {
   IngredientProgress,
   MissingMaterial,
   Recommendation,
+  RecommendationPathNode,
   RecommendationTarget,
   SkillResource,
   TmoSnapshot,
@@ -13,6 +14,9 @@ import type {
 
 const WISP_ID = "810e";
 const COMMON_GROUP = "흔함";
+const DISTORTED_GROUP = "왜곡됨";
+const LUMBER_ID = "LUMBER";
+const EXCLUDED_RECOMMENDATION_GROUPS = new Set(["흔함", "안흔함"]);
 const MAX_PLAN_STEPS = 2_000;
 
 // 카탈로그가 바뀔 때만 다시 계산하는 최상위 목표 점수표.
@@ -71,6 +75,7 @@ export type RecommendationModel = {
   candidates: readonly UnitDefinition[];
   combatProfiles: ReadonlyMap<string, CombatProfile>;
   topTargets: readonly TopTargetProfile[];
+  reverseDependencies: ReadonlyMap<string, ReadonlySet<string>>;
 };
 
 type BuildPlan = {
@@ -87,21 +92,38 @@ type BuildPlan = {
   unknownResources: string[];
 };
 
-type GoalAssessment = {
-  target: UnitDefinition;
-  combat: CombatProfile;
-  lane: DamageLane;
-  plan: BuildPlan;
-  dependencyDemand: ReadonlyMap<string, number>;
-  roleNeeds: Readonly<RoleScoreMap>;
-  opportunity: number;
-};
-
 type GoalMatch = {
-  assessment: GoalAssessment;
+  profile: TopTargetProfile;
   demand: number;
   score: number;
 };
+
+type CandidateTierBucket =
+  | "특별함"
+  | "희귀함"
+  | "전설·히든"
+  | "최상위"
+  | "기타";
+
+type QuickCandidate = {
+  unit: UnitDefinition;
+  combat: CombatProfile;
+  goalMatch: GoalMatch | null;
+  quickScore: number;
+  tierBucket: CandidateTierBucket;
+};
+
+const SHORTLIST_SIZE = 24;
+const FINAL_RECOMMENDATION_LIMIT = 8;
+const TIER_SHORTLIST_LIMITS: ReadonlyArray<
+  readonly [CandidateTierBucket, number]
+> = [
+  ["특별함", 3],
+  ["희귀함", 4],
+  ["전설·히든", 7],
+  ["최상위", 7],
+  ["기타", 3],
+];
 
 type ControlState = {
   hasSlow: boolean;
@@ -119,7 +141,9 @@ export function createRecommendationModel(
     ]),
   );
   const candidates = catalog.filter(
-    (unit) => Object.keys(unit.recipe).length > 0,
+    (unit) =>
+      Object.keys(unit.recipe).length > 0 &&
+      !EXCLUDED_RECOMMENDATION_GROUPS.has(unit.group),
   );
   const topTargets = candidates
     .map((target) => {
@@ -139,7 +163,14 @@ export function createRecommendationModel(
     })
     .filter((profile): profile is TopTargetProfile => profile !== null);
 
-  return { catalog, index, candidates, combatProfiles, topTargets };
+  return {
+    catalog,
+    index,
+    candidates,
+    combatProfiles,
+    topTargets,
+    reverseDependencies: createReverseDependencyIndex(candidates, index),
+  };
 }
 
 export function rankRecommendations(
@@ -160,11 +191,8 @@ export function rankRecommendations(
       !isCopyBlocked(profile.target.group, snapshot.units, index) &&
       (canPursueMystic || !profile.target.group.startsWith("신비함")),
   );
-  const assessments = goals.map((profile) =>
-    createGoalAssessment(profile, index, snapshot.units),
-  );
   const activeLane = getActiveDamageLane(snapshot.units, index);
-  const bestGoalLane = getBestGoalLane(assessments);
+  const bestGoalLane = getBestGoalLane(goals);
   const preferredLane = activeLane ?? bestGoalLane;
   const controlState = getControlState(snapshot.units, index);
   const ownedRoleCoverage = getOwnedRoleCoverage(
@@ -173,21 +201,71 @@ export function rankRecommendations(
     model.combatProfiles,
   );
 
-  return availableCandidates
-    .map((unit) =>
-      createRecommendation(
-        unit,
-        snapshot.units,
-        index,
-        getCombatProfile(model.combatProfiles, unit, index),
-        ownedRoleCoverage,
-        assessments,
-        preferredLane,
-        controlState,
-      ),
-    )
-    .sort((left, right) => right.score - left.score)
-    .slice(0, 5);
+  const quickCandidates = availableCandidates.map((unit) => {
+    const combat = getCombatProfile(model.combatProfiles, unit, index);
+    const directProgress = calculateDirectProgress(unit, snapshot.units, index);
+    const goalMatch = selectGoalForUnit(
+      unit,
+      combat,
+      goals,
+      preferredLane,
+      ownedRoleCoverage,
+      snapshot.units,
+      index,
+    );
+    const roleNeeds =
+      goalMatch?.profile.roleNeeds ?? createLaneRoleNeeds(preferredLane);
+    const roleBonus =
+      getRoleContribution(combat, roleNeeds, ownedRoleCoverage) * 30;
+    const downstreamCount =
+      model.reverseDependencies.get(normalizeId(unit.id))?.size ?? 0;
+    const downstreamBonus = Math.min(18, Math.log2(downstreamCount + 1) * 5);
+    const quickScore =
+      (goalMatch?.score ?? getGoalWeight(unit.group)) * 0.5 +
+      directProgress * 80 +
+      downstreamBonus +
+      (unit.priority ?? 0) * 0.8 +
+      getCandidateTierWeight(unit.group) +
+      getLaneSynergy(combat.lane, preferredLane) +
+      getControlBonus(unit, controlState) +
+      roleBonus;
+
+    return {
+      unit,
+      combat,
+      goalMatch,
+      quickScore,
+      tierBucket: getCandidateTierBucket(unit.group),
+    } satisfies QuickCandidate;
+  });
+  const shortlist = selectCandidateShortlist(quickCandidates);
+  const planCache = new Map<string, BuildPlan>();
+  const getPlan = (rootId: string): BuildPlan => {
+    const key = normalizeId(rootId);
+    const cached = planCache.get(key);
+    if (cached) {
+      return cached;
+    }
+
+    const plan = calculateBuildPlan(rootId, 1, index, snapshot.units);
+    planCache.set(key, plan);
+    return plan;
+  };
+  const recommendations = shortlist.map((candidate) =>
+    createRecommendation(
+      candidate.unit,
+      snapshot.units,
+      index,
+      candidate.combat,
+      ownedRoleCoverage,
+      candidate.goalMatch,
+      preferredLane,
+      controlState,
+      getPlan,
+    ),
+  );
+
+  return selectFinalRecommendations(recommendations);
 }
 
 function createRecommendation(
@@ -196,21 +274,18 @@ function createRecommendation(
   index: UnitIndex,
   combat: CombatProfile,
   ownedRoleCoverage: Readonly<RoleScoreMap>,
-  assessments: GoalAssessment[],
+  goalMatch: GoalMatch | null,
   preferredLane: DamageLane | null,
   controlState: ControlState,
+  getPlan: (rootId: string) => BuildPlan,
 ): Recommendation {
   const direct = createDirectIngredients(unit, owned, index);
-  const plan = calculateBuildPlan(unit.id, 1, index, owned);
-  const goalMatch = selectGoalForUnit(
-    unit,
-    combat,
-    assessments,
-    preferredLane,
-    ownedRoleCoverage,
-  );
+  const plan = getPlan(unit.id);
   const target = goalMatch
-    ? toRecommendationTarget(goalMatch.assessment)
+    ? toRecommendationTarget(
+        goalMatch.profile,
+        getPlan(goalMatch.profile.target.id),
+      )
     : toFallbackTarget(unit, combat, plan);
   const status = getStatus(plan);
   const candidateStun = getStunCapability(unit);
@@ -220,7 +295,7 @@ function createRecommendation(
   const goalScore = goalMatch ? goalMatch.score * 1.1 : 0;
   const tierBonus = getGoalWeight(unit.group) * 0.08;
   const roleNeeds =
-    goalMatch?.assessment.roleNeeds ?? createLaneRoleNeeds(preferredLane);
+    goalMatch?.profile.roleNeeds ?? createLaneRoleNeeds(preferredLane);
   const roleBonus =
     getRoleContribution(combat, roleNeeds, ownedRoleCoverage) * 42;
   const enhancementScore = getEnhancementScore(combat.enhancements, owned);
@@ -263,37 +338,9 @@ function createRecommendation(
     resourceRequirements: plan.requiredResources,
     missingPath,
     target,
+    path: createRecommendationPath(unit, target, index),
     status,
     reason,
-  };
-}
-
-function createGoalAssessment(
-  profile: TopTargetProfile,
-  index: UnitIndex,
-  owned: Record<string, number>,
-): GoalAssessment {
-  const plan = calculateBuildPlan(profile.target.id, 1, index, owned);
-  const progressFactor = 0.35 + plan.progress * 0.65;
-  const readyBonus = plan.missingTotal === 0 ? 20 : 0;
-  const enhancementScore = getEnhancementScore(
-    profile.combat.enhancements,
-    owned,
-  );
-  const copyAdjustment = getCopyAdjustment(profile.target.group, owned, index);
-
-  return {
-    target: profile.target,
-    combat: profile.combat,
-    lane: profile.lane,
-    plan,
-    dependencyDemand: profile.dependencyDemand,
-    roleNeeds: profile.roleNeeds,
-    opportunity:
-      profile.weight * progressFactor +
-      readyBonus +
-      enhancementScore +
-      copyAdjustment,
   };
 }
 
@@ -745,33 +792,36 @@ function getEnhancementScore(
 function selectGoalForUnit(
   unit: UnitDefinition,
   combat: CombatProfile,
-  assessments: GoalAssessment[],
+  profiles: readonly TopTargetProfile[],
   preferredLane: DamageLane | null,
   ownedRoleCoverage: Readonly<RoleScoreMap>,
+  owned: Record<string, number>,
+  index: UnitIndex,
 ): GoalMatch | null {
-  const matches = assessments.flatMap((assessment) => {
-    const demand = assessment.dependencyDemand.get(normalizeId(unit.id)) ?? 0;
+  const matches = profiles.flatMap((profile) => {
+    const demand = profile.dependencyDemand.get(normalizeId(unit.id)) ?? 0;
 
     if (demand === 0) {
       return [];
     }
 
     const demandFactor = Math.min(1.8, 1 + Math.log2(demand + 1) * 0.18);
-    const targetLaneFactor = getGoalLaneFactor(combat.lane, assessment.lane);
+    const targetLaneFactor = getGoalLaneFactor(combat.lane, profile.lane);
     const preferredLaneFactor = preferredLane
       ? getPreferredLaneFactor(combat.lane, preferredLane)
       : 1;
     const roleFactor =
       0.82 +
-      getRoleContribution(combat, assessment.roleNeeds, ownedRoleCoverage) *
-        0.36;
+      getRoleContribution(combat, profile.roleNeeds, ownedRoleCoverage) * 0.36;
+    const opportunity =
+      profile.weight + getCopyAdjustment(profile.target.group, owned, index);
 
     return [
       {
-        assessment,
+        profile,
         demand,
         score:
-          assessment.opportunity *
+          opportunity *
           demandFactor *
           targetLaneFactor *
           preferredLaneFactor *
@@ -781,6 +831,161 @@ function selectGoalForUnit(
   });
 
   return matches.sort((left, right) => right.score - left.score)[0] ?? null;
+}
+
+function calculateDirectProgress(
+  unit: UnitDefinition,
+  owned: Record<string, number>,
+  index: UnitIndex,
+): number {
+  let remainingWisp = owned[WISP_ID] ?? 0;
+  let requiredTotal = 0;
+  let coveredTotal = 0;
+
+  for (const [id, required] of Object.entries(unit.recipe)) {
+    const ownedCount = owned[id] ?? 0;
+    const ingredient = findUnit(index, id);
+    const canUseWisp = id !== WISP_ID && ingredient?.group === COMMON_GROUP;
+    const coveredByWisp = canUseWisp
+      ? Math.min(Math.max(required - ownedCount, 0), remainingWisp)
+      : 0;
+
+    remainingWisp -= coveredByWisp;
+    requiredTotal += required;
+    coveredTotal += Math.min(required, ownedCount + coveredByWisp);
+  }
+
+  return requiredTotal === 0 ? 1 : Math.min(coveredTotal / requiredTotal, 1);
+}
+
+function createReverseDependencyIndex(
+  roots: readonly UnitDefinition[],
+  index: UnitIndex,
+): Map<string, ReadonlySet<string>> {
+  const reverseDependencies = new Map<string, Set<string>>();
+
+  for (const root of roots) {
+    const rootKey = normalizeId(root.id);
+    const dependencies = buildDependencyDemand(root.id, index);
+
+    for (const dependencyId of dependencies.keys()) {
+      const dependencyKey = normalizeId(dependencyId);
+      if (dependencyKey === rootKey) {
+        continue;
+      }
+
+      const dependents = reverseDependencies.get(dependencyKey) ?? new Set();
+      dependents.add(root.id);
+      reverseDependencies.set(dependencyKey, dependents);
+    }
+  }
+
+  return reverseDependencies;
+}
+
+function selectCandidateShortlist(
+  candidates: readonly QuickCandidate[],
+): QuickCandidate[] {
+  const sorted = [...candidates].sort(compareQuickCandidates);
+  const selected = new Map<string, QuickCandidate>();
+  const bucketCounts = new Map<CandidateTierBucket, number>();
+
+  for (const [bucket, limit] of TIER_SHORTLIST_LIMITS) {
+    for (const candidate of sorted) {
+      if (candidate.tierBucket !== bucket) {
+        continue;
+      }
+
+      selected.set(normalizeId(candidate.unit.id), candidate);
+      const count = (bucketCounts.get(bucket) ?? 0) + 1;
+      bucketCounts.set(bucket, count);
+      if (count >= limit) {
+        break;
+      }
+    }
+  }
+
+  for (const candidate of sorted) {
+    if (selected.size >= SHORTLIST_SIZE) {
+      break;
+    }
+    selected.set(normalizeId(candidate.unit.id), candidate);
+  }
+
+  return Array.from(selected.values()).sort(compareQuickCandidates);
+}
+
+function selectFinalRecommendations(
+  recommendations: readonly Recommendation[],
+): Recommendation[] {
+  const sorted = [...recommendations].sort(compareRecommendations);
+  const selected = new Map<string, Recommendation>();
+
+  for (const bucket of ["특별함", "희귀함", "전설·히든", "최상위"] as const) {
+    const recommendation = sorted.find(
+      (candidate) => getCandidateTierBucket(candidate.unit.group) === bucket,
+    );
+    if (recommendation) {
+      selected.set(normalizeId(recommendation.unit.id), recommendation);
+    }
+  }
+
+  for (const recommendation of sorted) {
+    if (selected.size >= FINAL_RECOMMENDATION_LIMIT) {
+      break;
+    }
+    selected.set(normalizeId(recommendation.unit.id), recommendation);
+  }
+
+  return Array.from(selected.values()).sort(compareRecommendations);
+}
+
+function compareQuickCandidates(
+  left: QuickCandidate,
+  right: QuickCandidate,
+): number {
+  return (
+    right.quickScore - left.quickScore ||
+    left.unit.id.localeCompare(right.unit.id)
+  );
+}
+
+function compareRecommendations(
+  left: Recommendation,
+  right: Recommendation,
+): number {
+  return right.score - left.score || left.unit.id.localeCompare(right.unit.id);
+}
+
+function getCandidateTierBucket(group: string): CandidateTierBucket {
+  if (group === "특별함") {
+    return "특별함";
+  }
+  if (group === "희귀함") {
+    return "희귀함";
+  }
+  if (group.startsWith("전설") || group.startsWith("히든")) {
+    return "전설·히든";
+  }
+  if (getGoalWeight(group) > 0) {
+    return "최상위";
+  }
+  return "기타";
+}
+
+function getCandidateTierWeight(group: string): number {
+  switch (getCandidateTierBucket(group)) {
+    case "특별함":
+      return 8;
+    case "희귀함":
+      return 12;
+    case "전설·히든":
+      return 16;
+    case "최상위":
+      return 20;
+    default:
+      return 0;
+  }
 }
 
 function createDirectIngredients(
@@ -825,6 +1030,7 @@ function calculateBuildPlan(
   const pending = new Map<string, number>([[rootId, count]]);
   const missingById = new Map<string, number>();
   const requiredResources: Record<string, number> = {};
+  let distortedBuildCount = 0;
   let wispRemaining = inventory.get(WISP_ID) ?? 0;
   let workRequired = 0;
   let workCovered = 0;
@@ -838,6 +1044,15 @@ function calculateBuildPlan(
   const addMissing = (id: string, amount: number) => {
     missingById.set(id, (missingById.get(id) ?? 0) + amount);
   };
+
+  for (const [id, amount] of Object.entries(owned)) {
+    const unit = findUnit(index, id);
+    if (unit?.group !== DISTORTED_GROUP || amount <= 0) {
+      continue;
+    }
+
+    distortedBuildCount += amount;
+  }
 
   while (pending.size > 0 && steps < MAX_PLAN_STEPS) {
     steps += 1;
@@ -866,8 +1081,21 @@ function calculateBuildPlan(
       for (const [resourceId, resourceCount] of Object.entries(
         unit.resources,
       )) {
+        const scaledResourceCount =
+          unit.group === DISTORTED_GROUP && resourceId === LUMBER_ID
+            ? getProgressiveResourceCost(
+                resourceCount,
+                distortedBuildCount,
+                remaining,
+              )
+            : resourceCount * remaining;
+
         requiredResources[resourceId] =
-          (requiredResources[resourceId] ?? 0) + resourceCount * remaining;
+          (requiredResources[resourceId] ?? 0) + scaledResourceCount;
+      }
+
+      if (unit.group === DISTORTED_GROUP) {
+        distortedBuildCount += remaining;
       }
 
       if (Object.keys(unit.recipe).length > 0) {
@@ -905,7 +1133,7 @@ function calculateBuildPlan(
     ([id, required]) => {
       const ownedCount = owned[id];
 
-      return ownedCount !== undefined && ownedCount < required
+      return ownedCount === undefined || ownedCount < required
         ? [{ id, required, owned: ownedCount }]
         : [];
     },
@@ -913,9 +1141,21 @@ function calculateBuildPlan(
   const unknownResources = Object.keys(requiredResources).filter(
     (id) => owned[id] === undefined,
   );
+  const resourceProgress = Object.entries(requiredResources).reduce(
+    (progress, [id, required]) => {
+      if (required <= 0) {
+        return progress;
+      }
+
+      return Math.min(progress, Math.min(owned[id] ?? 0, required) / required);
+    },
+    1,
+  );
+  const workProgress =
+    workRequired === 0 ? 1 : Math.min(workCovered / workRequired, 1);
 
   return {
-    progress: workRequired === 0 ? 1 : Math.min(workCovered / workRequired, 1),
+    progress: Math.min(workProgress, resourceProgress),
     missingById,
     missingTotal,
     wispUsed,
@@ -923,6 +1163,14 @@ function calculateBuildPlan(
     missingResources,
     unknownResources,
   };
+}
+
+function getProgressiveResourceCost(
+  base: number,
+  startIndex: number,
+  count: number,
+): number {
+  return (base * (count * (2 * startIndex + count + 1))) / 2;
 }
 
 function createMissingMaterials(
@@ -1007,15 +1255,13 @@ function getActiveDamageLane(
   return scores.물딜 > scores.마딜 ? "물딜" : "마딜";
 }
 
-function getBestGoalLane(assessments: GoalAssessment[]): DamageLane | null {
+function getBestGoalLane(
+  profiles: readonly TopTargetProfile[],
+): DamageLane | null {
   return (
-    assessments
-      .filter(
-        (assessment) =>
-          assessment.lane === "물딜" || assessment.lane === "마딜",
-      )
-      .sort((left, right) => right.opportunity - left.opportunity)[0]?.lane ??
-    null
+    profiles
+      .filter((profile) => profile.lane === "물딜" || profile.lane === "마딜")
+      .sort((left, right) => right.weight - left.weight)[0]?.lane ?? null
   );
 }
 
@@ -1261,17 +1507,20 @@ function getStatus(plan: BuildPlan): "ready" | "near" | "planned" {
 }
 
 function toRecommendationTarget(
-  assessment: GoalAssessment,
+  profile: TopTargetProfile,
+  plan: BuildPlan,
 ): RecommendationTarget {
   return {
-    id: assessment.target.id,
-    name: assessment.target.name,
-    group: assessment.target.group,
-    lane: assessment.lane,
-    roles: [...assessment.combat.roles],
-    skillResource: assessment.combat.skillResource,
-    enhancements: [...assessment.combat.enhancements],
-    progress: assessment.plan.progress,
+    id: profile.target.id,
+    name: profile.target.name,
+    group: profile.target.group,
+    lane: profile.lane,
+    roles: [...profile.combat.roles],
+    skillResource: profile.combat.skillResource,
+    enhancements: [...profile.combat.enhancements],
+    progress: plan.progress,
+    resourceRequirements: plan.requiredResources,
+    missingResources: plan.missingResources,
   };
 }
 
@@ -1289,7 +1538,71 @@ function toFallbackTarget(
     skillResource: combat.skillResource,
     enhancements: [...combat.enhancements],
     progress: plan.progress,
+    resourceRequirements: plan.requiredResources,
+    missingResources: plan.missingResources,
   };
+}
+
+function createRecommendationPath(
+  unit: UnitDefinition,
+  target: RecommendationTarget,
+  index: UnitIndex,
+): RecommendationPathNode[] {
+  const ids = findPathFromTarget(
+    target.id,
+    unit.id,
+    index,
+    new Set(),
+  )?.reverse() ?? [unit.id];
+
+  return ids.map((id) => {
+    const definition = findUnit(index, id);
+
+    return {
+      id: definition?.id ?? id,
+      name: definition?.name ?? id,
+      group: definition?.group ?? target.group,
+      lane: definition ? getDamageLane(definition) : target.lane,
+    };
+  });
+}
+
+function findPathFromTarget(
+  targetId: string,
+  candidateId: string,
+  index: UnitIndex,
+  visited: ReadonlySet<string>,
+): string[] | null {
+  const target = findUnit(index, targetId);
+  if (!target) {
+    return null;
+  }
+
+  const targetKey = normalizeId(target.id);
+  if (targetKey === normalizeId(candidateId)) {
+    return [target.id];
+  }
+
+  if (visited.has(targetKey)) {
+    return null;
+  }
+
+  const nextVisited = new Set(visited);
+  nextVisited.add(targetKey);
+
+  for (const ingredientId of Object.keys(target.recipe)) {
+    const path = findPathFromTarget(
+      ingredientId,
+      candidateId,
+      index,
+      nextVisited,
+    );
+    if (path) {
+      return [target.id, ...path];
+    }
+  }
+
+  return null;
 }
 
 function createReason(

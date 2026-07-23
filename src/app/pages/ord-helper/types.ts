@@ -53,6 +53,19 @@ export type RecommendationTarget = {
   skillResource: SkillResource;
   enhancements: EnhancementRequirement[];
   progress: number;
+  resourceRequirements: Record<string, number>;
+  missingResources: Array<{
+    id: string;
+    required: number;
+    owned: number | undefined;
+  }>;
+};
+
+export type RecommendationPathNode = {
+  id: string;
+  name: string;
+  group: string;
+  lane: DamageLane;
 };
 
 export type MissingMaterial = {
@@ -87,6 +100,7 @@ export type Recommendation = {
   resourceRequirements: Record<string, number>;
   missingPath: MissingMaterial[];
   target: RecommendationTarget;
+  path: RecommendationPathNode[];
   status: "ready" | "near" | "planned";
   reason: string;
 };

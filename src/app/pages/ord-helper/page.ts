@@ -4,7 +4,6 @@ export type OrdHelperElements = {
   connectionState: HTMLSpanElement;
   connectionDetail: HTMLParagraphElement;
   connectionDot: HTMLSpanElement;
-  launchButton: HTMLButtonElement;
   demoButton: HTMLButtonElement;
   sourceLabel: HTMLSpanElement;
   observedUnitCount: HTMLSpanElement;
@@ -42,12 +41,9 @@ export function mountOrdHelperPage(root: HTMLDivElement): OrdHelperElements {
               <span class="connection-dot" data-connection-dot></span>
               <span class="connection-state" data-connection-state>연결 확인 중</span>
             </div>
-            <p data-connection-detail>로컬 TMO.GG 데스크톱을 찾고 있습니다.</p>
+            <p data-connection-detail>로컬 /datas 엔드포인트를 확인하고 있습니다.</p>
           </div>
           <div class="connection-actions">
-            <button class="ord-helper-button ord-helper-button-primary" type="button" data-launch-tmogg>
-              데스크톱 열기 ↗
-            </button>
             <button class="ord-helper-button" type="button" data-use-demo>
               데모 데이터 보기
             </button>
@@ -77,12 +73,12 @@ export function mountOrdHelperPage(root: HTMLDivElement): OrdHelperElements {
               <span class="live-pulse">●</span>
             </div>
             <div class="state-metrics">
-              <div><strong data-observed-unit-count>0</strong><span>감지된 유닛</span></div>
+              <div><strong data-observed-unit-count>0</strong><span>보유 유닛 종류</span></div>
               <div><strong data-banned-unit-count>0</strong><span>밴 목록</span></div>
               <div><strong data-received-at>—</strong><span>마지막 수신</span></div>
             </div>
             <div class="observed-units" data-observed-units>
-              <p class="empty-state">TMO.GG 연결 후 유닛 이름과 보유 수량이 표시됩니다.</p>
+              <p class="empty-state">/datas 연결 후 보유 유닛이 작게 표시됩니다.</p>
             </div>
           </section>
         </div>
@@ -90,15 +86,12 @@ export function mountOrdHelperPage(root: HTMLDivElement): OrdHelperElements {
         <section class="ord-helper-note">
           <div>
             <p class="ord-helper-kicker">DATA CONTRACT</p>
-          <h2>실제 조합 데이터 위에서 추천합니다.</h2>
+          <h2>등급별 조합 경로를 봅니다.</h2>
           </div>
           <p>
-            TMO.GG 빌드 헬퍼의 조합 데이터로 유닛 이름·재료·역할을 표시하고,
-            최상위 목표에서 역산한 조합 경로, 물딜·마딜 계열 시너지,
-            방깍·아머브레이크·마방깍·라인/단일/끝딜·보스/광폭 역할,
-            이감과 연계한 스턴 1 이상 조건, 마나 스킬/체력 스킬에 맞는
-            마나젠·체젠 조합, 전용 강화 아이템 보유 여부,
-            흔함을 대체하는 위습 사용량까지 계산합니다.
+            /datas에서 받은 유닛 ID를 로컬 조합 데이터와 즉시 매칭해,
+            특별함·희귀함·전설·히든·최상위 유닛으로 이어지는 이름과 등급만
+            간결하게 표시합니다.
           </p>
           <code>${TMO_DATAS_ENDPOINT}</code>
         </section>
@@ -110,7 +103,6 @@ export function mountOrdHelperPage(root: HTMLDivElement): OrdHelperElements {
     connectionState: getElement(root, "[data-connection-state]"),
     connectionDetail: getElement(root, "[data-connection-detail]"),
     connectionDot: getElement(root, "[data-connection-dot]"),
-    launchButton: getElement(root, "[data-launch-tmogg]"),
     demoButton: getElement(root, "[data-use-demo]"),
     sourceLabel: getElement(root, "[data-source-label]"),
     observedUnitCount: getElement(root, "[data-observed-unit-count]"),
